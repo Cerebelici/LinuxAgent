@@ -49,10 +49,30 @@ struct {
     __uint(max_entries, 512 * 1024); /* 512 KB Ring Buffer */
 } rb SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} target_cgroup_map SEC(".maps");
+
+static __always_inline int is_target_cgroup(void) {
+    __u32 key = 0;
+    __u64 *target_cgroup = bpf_map_lookup_elem(&target_cgroup_map, &key);
+    if (target_cgroup && *target_cgroup != 0) {
+        if (bpf_get_current_cgroup_id() != *target_cgroup) {
+            return 0; // Drop event: belongs to a different container or VM host
+        }
+    }
+    return 1;
+}
+
 /* 1. Capture Process Execution */
 SEC("tracepoint/sched/sched_process_exec")
 int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 {
+    if (!is_target_cgroup()) return 0;
+
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
     if (!e)
@@ -80,6 +100,8 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 SEC("tracepoint/syscalls/sys_enter_connect")
 int handle_connect(struct trace_event_raw_sys_enter *ctx)
 {
+    if (!is_target_cgroup()) return 0;
+
     struct sockaddr_in addr;
     struct sockaddr *user_addr = (struct sockaddr *)ctx->args[1];
     
@@ -119,6 +141,8 @@ int handle_connect(struct trace_event_raw_sys_enter *ctx)
 SEC("uretprobe//bin/bash:readline")
 int handle_bash_readline(struct pt_regs *ctx)
 {
+    if (!is_target_cgroup()) return 0;
+
     struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
     if (!e)
         return 0;
@@ -151,6 +175,8 @@ int handle_bash_readline(struct pt_regs *ctx)
 SEC("tracepoint/syscalls/sys_enter_process_vm_writev")
 int handle_process_vm_writev(struct trace_event_raw_sys_enter *ctx)
 {
+    if (!is_target_cgroup()) return 0;
+    
     u64 id = bpf_get_current_pid_tgid();
     u32 current_pid = id >> 32;
     u32 target_pid = (u32)ctx->args[0];
