@@ -6,6 +6,9 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+
+
 echo "[+] Step 1/4: Compiling eBPF kernel code for ARM..."
 clang -g -O2 -target bpf -D__TARGET_ARCH_arm64 -c proc_exec.bpf.c -o proc_exec.bpf.o
 
