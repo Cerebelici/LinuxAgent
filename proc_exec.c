@@ -18,7 +18,7 @@
 #define EVENT_TYPE_BASH 3
 #define EVENT_TYPE_INJECTION 4
 
-#define TARGET_HOST "sentinel.defence"
+#define TARGET_HOST "sentinel-defence"
 #define TARGET_PORT "9999"
 
 /* Custom libbpf print function callback */
