@@ -132,6 +132,17 @@ static __always_inline int is_noise_comm(const char *c)
     return 0;
 }
 
+/* Fast check to prevent self-telemetry feedback loop from the agent itself */
+static __always_inline int is_agent_comm(const char *c)
+{
+    /* proc_exec */
+    if (c[0] == 'p' && c[1] == 'r' && c[2] == 'o' && c[3] == 'c' &&
+        c[4] == '_' && c[5] == 'e' && c[6] == 'x' && c[7] == 'e' &&
+        c[8] == 'c' && c[9] == '\0')
+        return 1;
+    return 0;
+}
+
 /* 1. Capture Process Execution */
 SEC("tracepoint/sched/sched_process_exec")
 int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
@@ -143,6 +154,8 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 
     char comm[TASK_COMM_LEN];
     bpf_get_current_comm(&comm, sizeof(comm));
+    if (is_agent_comm(comm))
+        return 0;
 
     /* Check if process is explicitly blocked by Kill Switch policy */
     u8 *blocked = bpf_map_lookup_elem(&blocked_comms, comm);
@@ -189,6 +202,11 @@ int handle_connect(struct trace_event_raw_sys_enter *ctx)
     u64 id = bpf_get_current_pid_tgid();
     u32 pid = id >> 32;
     if (agent_tgid && pid == agent_tgid)
+        return 0;
+
+    char comm[TASK_COMM_LEN];
+    bpf_get_current_comm(&comm, sizeof(comm));
+    if (is_agent_comm(comm))
         return 0;
 
     struct sockaddr *user_addr = (struct sockaddr *)ctx->args[1];
@@ -358,6 +376,11 @@ int handle_openat(struct trace_event_raw_sys_enter *ctx)
     u64 id = bpf_get_current_pid_tgid();
     u32 pid = id >> 32;
     if (agent_tgid && pid == agent_tgid)
+        return 0;
+
+    char comm[TASK_COMM_LEN];
+    bpf_get_current_comm(&comm, sizeof(comm));
+    if (is_agent_comm(comm))
         return 0;
 
     int flags = (int)ctx->args[2];

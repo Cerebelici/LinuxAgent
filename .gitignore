@@ -7,3 +7,5 @@ vmlinux.h
 # Editor and OS files
 .vscode/
 .DS_Store
+__pycache__/
+*.pyc

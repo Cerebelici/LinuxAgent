@@ -570,6 +570,11 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     const struct event *e = data;
     total_events_processed++;
 
+    /* Filter out self-telemetry from the agent itself (defense-in-depth) */
+    if (strcmp(e->comm, "proc_exec") == 0 || (e->pid == (uint32_t)getpid())) {
+        return 0;
+    }
+
     /* 1. Filter out useless noise executions */
     if (e->type == EVENT_TYPE_EXEC && is_noise_comm(e->comm)) {
         return 0;

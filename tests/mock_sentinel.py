@@ -405,28 +405,43 @@ def run_integration_tests(port=8899):
                 print(f"[-] Schema violations encountered: {state.schema_violations}")
                 sys.exit(1)
 
-        # Check self-loop prevention: no CONNECT event should have pid == agent_proc.pid
+        # Check self-loop prevention: no CONNECT event should have pid == agent_proc.pid or comm == "proc_exec"
         agent_pid = agent_proc.pid
         with state.lock:
             for ev in state.received_events:
-                if ev.get("type") == "CONNECT" and ev.get("pid") == agent_pid:
-                    print(f"[-] FAIL: Agent self-loop detected! Found CONNECT from agent PID {agent_pid}")
+                if ev.get("type") == "CONNECT" and (ev.get("pid") == agent_pid or ev.get("comm") == "proc_exec"):
+                    print(f"[-] FAIL: Agent self-loop detected! Found CONNECT from agent PID {ev.get('pid')} (comm: {ev.get('comm')})")
                     sys.exit(1)
-        print("[+] Self-loop check passed: no CONNECT events from agent's own PID.")
+        print("[+] Self-loop check passed: no CONNECT events from agent's own PID or comm.")
 
         # Test retry logic with 500
         print("[*] Setting mock to fail telemetry with 500 three times...")
         with state.lock:
             state.fail_telemetry_500_count = 3
+            initial_batch_count = len(state.received_batches)
 
-        # Trigger more activity and wait for retries
+        # Trigger more activity and wait for retries across backoffs
         subprocess.run(f"bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}; echo hello' 2>/dev/null", shell=True)
-        time.sleep(5)
+        
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            with state.lock:
+                if state.fail_telemetry_500_count == 0 and len(state.received_batches) > initial_batch_count:
+                    break
+            time.sleep(0.5)
+
         with state.lock:
             print(f"[+] Remaining 500 counts: {state.fail_telemetry_500_count}")
+            if state.fail_telemetry_500_count > 0:
+                print(f"[-] FAIL: Agent did not retry and exhaust 500 errors (remaining: {state.fail_telemetry_500_count})")
+                sys.exit(1)
             # Ensure sequence contiguous
             seqs = [b["batch"]["seq"] for b in state.received_batches]
             print(f"[+] Batch sequences recorded: {seqs}")
+            for i in range(len(seqs) - 1):
+                if seqs[i+1] != seqs[i] + 1:
+                    print(f"[-] FAIL: Sequence numbers not contiguous: {seqs}")
+                    sys.exit(1)
 
         print("[+] Integration test completed successfully!")
 
