@@ -1,0 +1,9 @@
+# Build artifacts
+proc_exec
+proc_exec.bpf.o
+proc_exec.skel.h
+vmlinux.h
+
+# Editor and OS files
+.vscode/
+.DS_Store
