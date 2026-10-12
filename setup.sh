@@ -12,6 +12,10 @@ sudo apt-get install -y \
     libelf-dev \
     libbpf-dev \
     pkg-config \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    zlib1g-dev \
+    python3 \
     linux-headers-$(uname -r) \
     linux-tools-common \
     linux-tools-$(uname -r) || true

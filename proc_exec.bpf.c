@@ -26,6 +26,7 @@
 #define EVENT_TYPE_MEMFD_EXEC 8
 
 struct event {
+    u64 ts_ns;
     u32 type;           /* 1=EXEC, 2=CONNECT, 3=BASH, 4=INJECTION, 5=FILE_TAMPER, 6=PRIV_ESC, 7=KERNEL_MOD, 8=MEMFD_EXEC */
     u32 pid;
     u32 ppid;
@@ -39,6 +40,7 @@ struct event {
         
         struct {
             u32 daddr;
+            u8 daddr6[16];
             u16 dport;
             u16 family;
         } connect;
@@ -54,6 +56,8 @@ struct event {
         } priv_esc;
     } data;
 };
+
+const volatile u32 agent_tgid = 0;
 
 /* 512 KB Kernel Ring Buffer for high-throughput event streaming */
 struct {
@@ -132,6 +136,11 @@ static __always_inline int is_noise_comm(const char *c)
 SEC("tracepoint/sched/sched_process_exec")
 int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 {
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    if (agent_tgid && pid == agent_tgid)
+        return 0;
+
     char comm[TASK_COMM_LEN];
     bpf_get_current_comm(&comm, sizeof(comm));
 
@@ -154,9 +163,9 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     if (!e)
         return 0;
 
+    e->ts_ns = bpf_ktime_get_boot_ns();
     e->type = EVENT_TYPE_EXEC;
-    u64 id = bpf_get_current_pid_tgid();
-    e->pid = id >> 32;
+    e->pid = pid;
     e->ppid = BPF_CORE_READ(task, real_parent, tgid);
 
     u64 uid_gid = bpf_get_current_uid_gid();
@@ -177,36 +186,51 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 SEC("tracepoint/syscalls/sys_enter_connect")
 int handle_connect(struct trace_event_raw_sys_enter *ctx)
 {
-    struct sockaddr_in addr;
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    if (agent_tgid && pid == agent_tgid)
+        return 0;
+
     struct sockaddr *user_addr = (struct sockaddr *)ctx->args[1];
-    
     if (!user_addr)
         return 0;
 
-    bpf_probe_read_user(&addr, sizeof(addr), user_addr);
+    u16 family = 0;
+    bpf_probe_read_user(&family, sizeof(family), &user_addr->sa_family);
 
-    if (addr.sin_family != AF_INET)
+    if (family != AF_INET && family != AF_INET6)
         return 0;
 
     struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
     if (!e)
         return 0;
 
+    e->ts_ns = bpf_ktime_get_boot_ns();
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    u64 id = bpf_get_current_pid_tgid();
     u64 uid_gid = bpf_get_current_uid_gid();
 
     e->type = EVENT_TYPE_CONNECT;
-    e->pid = id >> 32;
+    e->pid = pid;
     e->ppid = BPF_CORE_READ(task, real_parent, tgid);
     e->uid = (u32)uid_gid;
     e->gid = (u32)(uid_gid >> 32);
 
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    e->data.connect.family = family;
 
-    e->data.connect.family = addr.sin_family;
-    e->data.connect.daddr = addr.sin_addr.s_addr;
-    e->data.connect.dport = bpf_ntohs(addr.sin_port);
+    if (family == AF_INET) {
+        struct sockaddr_in addr;
+        bpf_probe_read_user(&addr, sizeof(addr), user_addr);
+        e->data.connect.daddr = addr.sin_addr.s_addr;
+        e->data.connect.dport = bpf_ntohs(addr.sin_port);
+        __builtin_memset(e->data.connect.daddr6, 0, sizeof(e->data.connect.daddr6));
+    } else {
+        struct sockaddr_in6 addr6;
+        bpf_probe_read_user(&addr6, sizeof(addr6), user_addr);
+        e->data.connect.daddr = 0;
+        e->data.connect.dport = bpf_ntohs(addr6.sin6_port);
+        bpf_probe_read_kernel(e->data.connect.daddr6, sizeof(e->data.connect.daddr6), &addr6.sin6_addr);
+    }
 
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -216,6 +240,11 @@ int handle_connect(struct trace_event_raw_sys_enter *ctx)
 SEC("uretprobe//bin/bash:readline")
 int handle_bash_readline(struct pt_regs *ctx)
 {
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    if (agent_tgid && pid == agent_tgid)
+        return 0;
+
     char *cmd = (char *)PT_REGS_RC(ctx);
     if (!cmd)
         return 0;
@@ -224,9 +253,9 @@ int handle_bash_readline(struct pt_regs *ctx)
     if (!e)
         return 0;
 
+    e->ts_ns = bpf_ktime_get_boot_ns();
     e->type = EVENT_TYPE_BASH;
-    u64 id = bpf_get_current_pid_tgid();
-    e->pid = id >> 32;
+    e->pid = pid;
 
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     e->ppid = BPF_CORE_READ(task, real_parent, tgid);
@@ -248,6 +277,9 @@ int handle_process_vm_writev(struct trace_event_raw_sys_enter *ctx)
 {
     u64 id = bpf_get_current_pid_tgid();
     u32 current_pid = id >> 32;
+    if (agent_tgid && current_pid == agent_tgid)
+        return 0;
+
     u32 target_pid = (u32)ctx->args[0];
     if (current_pid == target_pid || target_pid <= 1)
         return 0;
@@ -256,6 +288,7 @@ int handle_process_vm_writev(struct trace_event_raw_sys_enter *ctx)
     if (!e)
         return 0;
 
+    e->ts_ns = bpf_ktime_get_boot_ns();
     e->type = EVENT_TYPE_INJECTION;
     e->pid = current_pid;
 
@@ -280,6 +313,9 @@ int handle_ptrace(struct trace_event_raw_sys_enter *ctx)
 {
     u64 id = bpf_get_current_pid_tgid();
     u32 current_pid = id >> 32;
+    if (agent_tgid && current_pid == agent_tgid)
+        return 0;
+
     u32 target_pid = (u32)ctx->args[1];
     long req = (long)ctx->args[0];
 
@@ -296,6 +332,7 @@ int handle_ptrace(struct trace_event_raw_sys_enter *ctx)
     if (!e)
         return 0;
 
+    e->ts_ns = bpf_ktime_get_boot_ns();
     e->type = EVENT_TYPE_INJECTION;
     e->pid = current_pid;
 
@@ -318,6 +355,11 @@ int handle_ptrace(struct trace_event_raw_sys_enter *ctx)
 SEC("tracepoint/syscalls/sys_enter_openat")
 int handle_openat(struct trace_event_raw_sys_enter *ctx)
 {
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    if (agent_tgid && pid == agent_tgid)
+        return 0;
+
     int flags = (int)ctx->args[2];
 
     /* Only inspect write/create/truncate operations (O_WRONLY=1, O_RDWR=2, O_CREAT=64, O_TRUNC=512) */
@@ -345,9 +387,9 @@ int handle_openat(struct trace_event_raw_sys_enter *ctx)
     if (!e)
         return 0;
 
+    e->ts_ns = bpf_ktime_get_boot_ns();
     e->type = EVENT_TYPE_FILE_TAMPER;
-    u64 id = bpf_get_current_pid_tgid();
-    e->pid = id >> 32;
+    e->pid = pid;
 
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     e->ppid = BPF_CORE_READ(task, real_parent, tgid);
@@ -367,13 +409,18 @@ int handle_openat(struct trace_event_raw_sys_enter *ctx)
 SEC("tracepoint/syscalls/sys_enter_init_module")
 int handle_init_module(struct trace_event_raw_sys_enter *ctx)
 {
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    if (agent_tgid && pid == agent_tgid)
+        return 0;
+
     struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
     if (!e)
         return 0;
 
+    e->ts_ns = bpf_ktime_get_boot_ns();
     e->type = EVENT_TYPE_KERNEL_MOD;
-    u64 id = bpf_get_current_pid_tgid();
-    e->pid = id >> 32;
+    e->pid = pid;
 
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     e->ppid = BPF_CORE_READ(task, real_parent, tgid);
@@ -397,13 +444,18 @@ int handle_init_module(struct trace_event_raw_sys_enter *ctx)
 SEC("tracepoint/syscalls/sys_enter_finit_module")
 int handle_finit_module(struct trace_event_raw_sys_enter *ctx)
 {
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    if (agent_tgid && pid == agent_tgid)
+        return 0;
+
     struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
     if (!e)
         return 0;
 
+    e->ts_ns = bpf_ktime_get_boot_ns();
     e->type = EVENT_TYPE_KERNEL_MOD;
-    u64 id = bpf_get_current_pid_tgid();
-    e->pid = id >> 32;
+    e->pid = pid;
 
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     e->ppid = BPF_CORE_READ(task, real_parent, tgid);
@@ -414,11 +466,11 @@ int handle_finit_module(struct trace_event_raw_sys_enter *ctx)
 
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
     
-    int fd = (int)ctx->args[0];
+    u32 ufd = (u32)ctx->args[0];
     e->data.filename[0] = 'f';
     e->data.filename[1] = 'd';
     e->data.filename[2] = ':';
-    e->data.filename[3] = '0' + (fd % 10);
+    e->data.filename[3] = '0' + (ufd % 10);
     e->data.filename[4] = '\0';
 
     bpf_ringbuf_submit(e, 0);
@@ -429,6 +481,11 @@ int handle_finit_module(struct trace_event_raw_sys_enter *ctx)
 SEC("tracepoint/syscalls/sys_enter_setuid")
 int handle_setuid(struct trace_event_raw_sys_enter *ctx)
 {
+    u64 id = bpf_get_current_pid_tgid();
+    u32 current_pid = id >> 32;
+    if (agent_tgid && current_pid == agent_tgid)
+        return 0;
+
     u32 target_uid = (u32)ctx->args[0];
     u64 uid_gid = bpf_get_current_uid_gid();
     u32 current_uid = (u32)uid_gid;
@@ -441,9 +498,9 @@ int handle_setuid(struct trace_event_raw_sys_enter *ctx)
     if (!e)
         return 0;
 
+    e->ts_ns = bpf_ktime_get_boot_ns();
     e->type = EVENT_TYPE_PRIV_ESC;
-    u64 id = bpf_get_current_pid_tgid();
-    e->pid = id >> 32;
+    e->pid = current_pid;
 
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     e->ppid = BPF_CORE_READ(task, real_parent, tgid);
@@ -462,13 +519,18 @@ int handle_setuid(struct trace_event_raw_sys_enter *ctx)
 SEC("tracepoint/syscalls/sys_enter_memfd_create")
 int handle_memfd_create(struct trace_event_raw_sys_enter *ctx)
 {
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    if (agent_tgid && pid == agent_tgid)
+        return 0;
+
     struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
     if (!e)
         return 0;
 
+    e->ts_ns = bpf_ktime_get_boot_ns();
     e->type = EVENT_TYPE_MEMFD_EXEC;
-    u64 id = bpf_get_current_pid_tgid();
-    e->pid = id >> 32;
+    e->pid = pid;
 
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     e->ppid = BPF_CORE_READ(task, real_parent, tgid);
