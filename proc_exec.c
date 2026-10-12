@@ -22,6 +22,7 @@
 
 #define TASK_COMM_LEN 16
 #define PATH_LEN 256
+#define MAX_INVENTORY_PROCS 2048
 
 /* Event types matching proc_exec.bpf.c */
 #define EVENT_TYPE_EXEC 1
@@ -96,6 +97,22 @@ struct agent_config {
     char hostname[128];
 };
 
+/* Process node for full process tree and service inspection */
+struct proc_node {
+    pid_t pid;
+    pid_t ppid;
+    uid_t uid;
+    char comm[TASK_COMM_LEN];
+    char state;
+    char exe[PATH_LEN];
+    char cmdline[512];
+    char version[128];
+    int depth;
+    int is_service;
+    const char *reputation;      /* "GOOD", "SUSPICIOUS", "BAD" */
+    char assessment[256];
+};
+
 static struct agent_config config;
 static volatile sig_atomic_t stop = 0;
 static int siem_sockfd = -1;
@@ -132,6 +149,11 @@ static const char *const NOISE_COMM_LIST[] = {
     "dircolors", "stty", "tput", "uptime", "hostname", "locale",
     NULL
 };
+
+/* Forward declarations */
+static void send_siem_direct(const char *buf);
+static void report_process_tree_to_siem(void);
+static void report_services_to_siem(void);
 
 /* Helper: Custom libbpf print callback */
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -479,6 +501,483 @@ static void assess_event(const struct event *e, struct threat_assessment *out)
 }
 
 /* ========================================================================= */
+/* PROCESS & SERVICE REPUTATION / VERSION DETECTION ENGINE                  */
+/* ========================================================================= */
+
+/* Assess process / service safety: classifies into GOOD, SUSPICIOUS, BAD */
+static void evaluate_process_reputation(struct proc_node *p)
+{
+    /* 1. Kernel worker threads */
+    if (p->pid == 2 || p->ppid == 2) {
+        p->reputation = "GOOD";
+        snprintf(p->assessment, sizeof(p->assessment), "Legitimate Linux kernel task");
+        return;
+    }
+
+    /* 2. Malicious or volatile directories (CRITICAL BAD) */
+    if (strncmp(p->exe, "/tmp/", 5) == 0 || strncmp(p->exe, "/var/tmp/", 9) == 0 ||
+        strncmp(p->exe, "/dev/shm/", 9) == 0 || strncmp(p->exe, "/dev/", 5) == 0 ||
+        strstr(p->exe, "(deleted)") != NULL) {
+        p->reputation = "BAD";
+        snprintf(p->assessment, sizeof(p->assessment), "CRITICAL: Binary executing from untrusted path or deleted from disk");
+        return;
+    }
+
+    /* 3. Known malicious or offensive security tool binaries */
+    static const char *const MALICIOUS_NAMES[] = {
+        "xmrig", "minerd", "stratum", "chisel", "mimikatz", "linpeas",
+        "masscan", "sqlmap", "hydra", "john", NULL
+    };
+    for (int i = 0; MALICIOUS_NAMES[i] != NULL; i++) {
+        if (strstr(p->comm, MALICIOUS_NAMES[i]) || strstr(p->cmdline, MALICIOUS_NAMES[i])) {
+            p->reputation = "BAD";
+            snprintf(p->assessment, sizeof(p->assessment), "CRITICAL: Known malicious or offensive binary detected");
+            return;
+        }
+    }
+
+    /* 4. Masquerading check: kernel thread name in userspace */
+    if (strncmp(p->comm, "kworker", 7) == 0 && p->ppid != 2 && strlen(p->exe) > 0) {
+        p->reputation = "BAD";
+        snprintf(p->assessment, sizeof(p->assessment), "CRITICAL: Userspace process masquerading as kernel thread");
+        return;
+    }
+
+    /* 5. Suspicious network daemons or shell relays */
+    if ((strcmp(p->comm, "nc") == 0 || strcmp(p->comm, "ncat") == 0 || strcmp(p->comm, "socat") == 0) &&
+        (strstr(p->cmdline, "-e") || strstr(p->cmdline, "sh"))) {
+        p->reputation = "BAD";
+        snprintf(p->assessment, sizeof(p->assessment), "CRITICAL: Network relay spawning shell execution");
+        return;
+    }
+
+    /* 6. Script interpreter running directly under init as service without wrapper */
+    if ((strcmp(p->comm, "python") == 0 || strcmp(p->comm, "python3") == 0 ||
+         strcmp(p->comm, "perl") == 0 || strcmp(p->comm, "ruby") == 0) && p->ppid == 1) {
+        p->reputation = "SUSPICIOUS";
+        snprintf(p->assessment, sizeof(p->assessment), "WARNING: Standalone scripting interpreter running directly under init");
+        return;
+    }
+
+    /* 7. Root service executing from user home directory */
+    if (p->uid == 0 && (strncmp(p->exe, "/home/", 6) == 0 || strncmp(p->exe, "/root/", 6) == 0)) {
+        p->reputation = "SUSPICIOUS";
+        snprintf(p->assessment, sizeof(p->assessment), "WARNING: Root privilege daemon running from user home directory");
+        return;
+    }
+
+    /* 8. Standard Linux system directories */
+    if (strncmp(p->exe, "/usr/sbin/", 10) == 0 || strncmp(p->exe, "/usr/bin/", 9) == 0 ||
+        strncmp(p->exe, "/sbin/", 6) == 0 || strncmp(p->exe, "/bin/", 5) == 0 ||
+        strncmp(p->exe, "/lib/", 5) == 0 || strncmp(p->exe, "/usr/lib/", 9) == 0) {
+        p->reputation = "GOOD";
+        snprintf(p->assessment, sizeof(p->assessment), "Standard system binary in verified directory");
+        return;
+    }
+
+    p->reputation = "SUSPICIOUS";
+    snprintf(p->assessment, sizeof(p->assessment), "Non-standard execution path or unverified binary");
+}
+
+/* Query version string of running service safely */
+static void query_service_version(const char *comm, const char *exe, char *ver_buf, size_t ver_buf_len)
+{
+    ver_buf[0] = '\0';
+
+    /* Refuse to execute untrusted binaries */
+    if (strncmp(exe, "/tmp/", 5) == 0 || strncmp(exe, "/var/tmp/", 9) == 0 ||
+        strncmp(exe, "/dev/shm/", 9) == 0 || strstr(exe, "(deleted)") != NULL) {
+        snprintf(ver_buf, ver_buf_len, "Untrusted / Unverified");
+        return;
+    }
+
+    char cmd[512] = {0};
+    if (strstr(comm, "sshd") || strstr(exe, "sshd")) {
+        snprintf(cmd, sizeof(cmd), "%s -V 2>&1", exe);
+    } else if (strstr(comm, "nginx") || strstr(exe, "nginx")) {
+        snprintf(cmd, sizeof(cmd), "%s -v 2>&1", exe);
+    } else if (strstr(comm, "apache") || strstr(comm, "httpd") || strstr(exe, "apache2")) {
+        snprintf(cmd, sizeof(cmd), "%s -v 2>&1", exe);
+    } else if (strstr(comm, "systemd") || strstr(exe, "systemd")) {
+        snprintf(cmd, sizeof(cmd), "systemctl --version 2>&1");
+    } else if (strstr(comm, "docker") || strstr(exe, "dockerd")) {
+        snprintf(cmd, sizeof(cmd), "dockerd --version 2>&1");
+    } else if (strstr(comm, "containerd") || strstr(exe, "containerd")) {
+        snprintf(cmd, sizeof(cmd), "containerd --version 2>&1");
+    } else if (strstr(comm, "redis") || strstr(exe, "redis-server")) {
+        snprintf(cmd, sizeof(cmd), "%s --version 2>&1", exe);
+    } else if (strstr(comm, "postgres") || strstr(exe, "postgres")) {
+        snprintf(cmd, sizeof(cmd), "%s --version 2>&1", exe);
+    } else if (strstr(comm, "cron") || strstr(exe, "cron")) {
+        snprintf(cmd, sizeof(cmd), "%s -V 2>&1", exe);
+    } else if (strstr(comm, "rsyslog") || strstr(exe, "rsyslogd")) {
+        snprintf(cmd, sizeof(cmd), "%s -v 2>&1", exe);
+    } else if (strncmp(exe, "/usr/", 5) == 0 || strncmp(exe, "/bin/", 5) == 0 ||
+               strncmp(exe, "/sbin/", 6) == 0) {
+        snprintf(cmd, sizeof(cmd), "%s --version 2>&1", exe);
+    }
+
+    if (cmd[0] != '\0') {
+        FILE *fp = popen(cmd, "r");
+        if (fp) {
+            char line[256];
+            if (fgets(line, sizeof(line), fp)) {
+                size_t l = strlen(line);
+                while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) {
+                    line[--l] = '\0';
+                }
+                int has_digit = 0;
+                for (size_t i = 0; i < l; i++) {
+                    if (isdigit((unsigned char)line[i])) {
+                        has_digit = 1;
+                        break;
+                    }
+                }
+                if (has_digit && l > 0) {
+                    strncpy(ver_buf, line, ver_buf_len - 1);
+                    ver_buf[ver_buf_len - 1] = '\0';
+                }
+            }
+            pclose(fp);
+        }
+    }
+
+    if (ver_buf[0] == '\0') {
+        snprintf(ver_buf, ver_buf_len, "Installed");
+    }
+}
+
+/* Collect and audit running processes across /proc */
+static int collect_processes(struct proc_node **procs_out, int *count_out)
+{
+    *procs_out = NULL;
+    *count_out = 0;
+
+    DIR *dir = opendir("/proc");
+    if (!dir) return -1;
+
+    struct proc_node *procs = calloc(MAX_INVENTORY_PROCS, sizeof(struct proc_node));
+    if (!procs) {
+        closedir(dir);
+        return -1;
+    }
+
+    int count = 0;
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL && count < MAX_INVENTORY_PROCS) {
+        char *endptr;
+        long pid = strtol(entry->d_name, &endptr, 10);
+        if (*endptr != '\0' || pid <= 0) continue;
+
+        struct proc_node *p = &procs[count];
+        p->pid = (pid_t)pid;
+        p->ppid = 0;
+        p->state = '?';
+        p->reputation = "UNKNOWN";
+
+        /* Read /proc/<pid>/stat for PPID and State */
+        char path_buf[128];
+        snprintf(path_buf, sizeof(path_buf), "/proc/%ld/stat", pid);
+        FILE *f = fopen(path_buf, "r");
+        if (f) {
+            char buf[512];
+            if (fgets(buf, sizeof(buf), f)) {
+                char *close_paren = strrchr(buf, ')');
+                if (close_paren) {
+                    char st = '?';
+                    long ppid = 0;
+                    if (sscanf(close_paren + 1, " %c %ld", &st, &ppid) == 2) {
+                        p->state = st;
+                        p->ppid = (pid_t)ppid;
+                    }
+                }
+            }
+            fclose(f);
+        }
+
+        /* Read /proc/<pid>/comm */
+        snprintf(path_buf, sizeof(path_buf), "/proc/%ld/comm", pid);
+        f = fopen(path_buf, "r");
+        if (f) {
+            if (fgets(p->comm, sizeof(p->comm), f)) {
+                size_t l = strlen(p->comm);
+                if (l > 0 && p->comm[l - 1] == '\n') p->comm[l - 1] = '\0';
+            }
+            fclose(f);
+        }
+
+        /* Read /proc/<pid>/status for UID */
+        snprintf(path_buf, sizeof(path_buf), "/proc/%ld/status", pid);
+        f = fopen(path_buf, "r");
+        if (f) {
+            char line[128];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "Uid:", 4) == 0) {
+                    unsigned int ruid = 0;
+                    if (sscanf(line + 4, "%u", &ruid) == 1) {
+                        p->uid = ruid;
+                    }
+                    break;
+                }
+            }
+            fclose(f);
+        }
+
+        /* Read /proc/<pid>/exe symlink */
+        snprintf(path_buf, sizeof(path_buf), "/proc/%ld/exe", pid);
+        ssize_t link_len = readlink(path_buf, p->exe, sizeof(p->exe) - 1);
+        if (link_len > 0) {
+            p->exe[link_len] = '\0';
+        } else {
+            p->exe[0] = '\0';
+        }
+
+        /* Read /proc/<pid>/cmdline */
+        snprintf(path_buf, sizeof(path_buf), "/proc/%ld/cmdline", pid);
+        int fd = open(path_buf, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, p->cmdline, sizeof(p->cmdline) - 1);
+            if (n > 0) {
+                p->cmdline[n] = '\0';
+                for (ssize_t i = 0; i < n - 1; i++) {
+                    if (p->cmdline[i] == '\0') p->cmdline[i] = ' ';
+                }
+            } else {
+                p->cmdline[0] = '\0';
+            }
+            close(fd);
+        }
+
+        /* Identify if process is a service */
+        p->is_service = 0;
+        if (p->ppid == 1 && p->pid != 1) {
+            p->is_service = 1;
+        } else {
+            static const char *const DAEMON_NAMES[] = {
+                "systemd", "sshd", "cron", "nginx", "apache2", "httpd", "dockerd",
+                "containerd", "redis-server", "mysqld", "postgres", "systemd-journald",
+                "systemd-resolved", "systemd-networkd", "systemd-udevd", "rsyslogd",
+                "dbus-daemon", "polkitd", "chronyd", "auditd", "ufw", "fail2ban",
+                "named", "dnsmasq", "smbd", "cupsd", NULL
+            };
+            for (int k = 0; DAEMON_NAMES[k] != NULL; k++) {
+                if (strstr(p->comm, DAEMON_NAMES[k]) != NULL) {
+                    p->is_service = 1;
+                    break;
+                }
+            }
+        }
+
+        if (p->is_service) {
+            query_service_version(p->comm, p->exe, p->version, sizeof(p->version));
+        } else {
+            p->version[0] = '\0';
+        }
+
+        /* Evaluate reputation */
+        evaluate_process_reputation(p);
+
+        count++;
+    }
+
+    closedir(dir);
+
+    /* Compute tree depth hierarchy */
+    for (int i = 0; i < count; i++) {
+        int d = 0;
+        pid_t curr_ppid = procs[i].ppid;
+        int loop_guard = 0;
+        while (curr_ppid > 0 && loop_guard < 16) {
+            int found_parent = 0;
+            for (int j = 0; j < count; j++) {
+                if (procs[j].pid == curr_ppid) {
+                    d++;
+                    curr_ppid = procs[j].ppid;
+                    found_parent = 1;
+                    break;
+                }
+            }
+            if (!found_parent) break;
+            loop_guard++;
+        }
+        procs[i].depth = d;
+    }
+
+    *procs_out = procs;
+    *count_out = count;
+    return 0;
+}
+
+/* Audit and stream full process tree with good/bad evaluations to SIEM */
+static void report_process_tree_to_siem(void)
+{
+    struct proc_node *procs = NULL;
+    int count = 0;
+    if (collect_processes(&procs, &count) != 0 || count == 0) {
+        char err_msg[256];
+        snprintf(err_msg, sizeof(err_msg),
+                 "{\"type\":\"ACTION_RESULT\",\"action\":\"process_tree\",\"status\":\"FAILED\","
+                 "\"message\":\"Could not inspect /proc\",\"agent_id\":\"%s\"}\n", config.hostname);
+        send_siem_direct(err_msg);
+        return;
+    }
+
+    int good_count = 0, susp_count = 0, bad_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(procs[i].reputation, "GOOD") == 0) good_count++;
+        else if (strcmp(procs[i].reputation, "BAD") == 0) bad_count++;
+        else susp_count++;
+    }
+
+    char now_str[64];
+    get_iso8601_time(now_str, sizeof(now_str));
+
+    printf("\n%s=================================================================================%s\n", COLOR_CYAN, COLOR_RESET);
+    printf("%s[🌳 PROCESS TREE AUDIT] Total: %d | Good: %s%d%s | Suspicious: %s%d%s | Bad: %s%d%s%s\n",
+           COLOR_BOLD, count, COLOR_GREEN, good_count, COLOR_BOLD,
+           COLOR_YELLOW, susp_count, COLOR_BOLD,
+           COLOR_RED, bad_count, COLOR_BOLD, COLOR_RESET);
+    printf("%s=================================================================================%s\n", COLOR_CYAN, COLOR_RESET);
+
+    /* 1. Transmit header */
+    char header[512];
+    snprintf(header, sizeof(header),
+             "{\"type\":\"PROCESS_TREE_HEADER\",\"agent_id\":\"%s\",\"total\":%d,\"good\":%d,"
+             "\"suspicious\":%d,\"bad\":%d,\"timestamp\":\"%s\"}\n",
+             config.hostname, count, good_count, susp_count, bad_count, now_str);
+    send_siem_direct(header);
+
+    /* 2. Stream all nodes */
+    for (int i = 0; i < count; i++) {
+        struct proc_node *p = &procs[i];
+
+        char esc_comm[32], esc_exe[512], esc_cmd[1024], esc_assess[512], esc_ver[128];
+        json_escape(p->comm, esc_comm, sizeof(esc_comm));
+        json_escape(p->exe, esc_exe, sizeof(esc_exe));
+        json_escape(p->cmdline, esc_cmd, sizeof(esc_cmd));
+        json_escape(p->assessment, esc_assess, sizeof(esc_assess));
+        json_escape(p->version, esc_ver, sizeof(esc_ver));
+
+        char node[2048];
+        snprintf(node, sizeof(node),
+                 "{\"type\":\"PROCESS_TREE_NODE\",\"depth\":%d,\"pid\":%d,\"ppid\":%d,\"uid\":%u,"
+                 "\"comm\":\"%s\",\"state\":\"%c\",\"exe\":\"%s\",\"cmdline\":\"%s\",\"reputation\":\"%s\","
+                 "\"assessment\":\"%s\",\"version\":\"%s\",\"agent_id\":\"%s\",\"timestamp\":\"%s\"}\n",
+                 p->depth, p->pid, p->ppid, p->uid, esc_comm, p->state, esc_exe, esc_cmd,
+                 p->reputation, esc_assess, esc_ver, config.hostname, now_str);
+        send_siem_direct(node);
+
+        /* Console visualization */
+        const char *rep_color = COLOR_GREEN;
+        if (strcmp(p->reputation, "BAD") == 0) rep_color = COLOR_RED;
+        else if (strcmp(p->reputation, "SUSPICIOUS") == 0) rep_color = COLOR_YELLOW;
+
+        if (strcmp(p->reputation, "BAD") == 0 || strcmp(p->reputation, "SUSPICIOUS") == 0 || p->depth <= 1) {
+            for (int k = 0; k < p->depth; k++) printf("  ");
+            printf("%sPID %-5d (PPID %-5d) [%s]: %s%s %s\n",
+                   rep_color, p->pid, p->ppid, p->reputation, p->comm,
+                   strlen(p->version) > 0 ? p->version : "", COLOR_RESET);
+            if (strcmp(p->reputation, "BAD") == 0 || strcmp(p->reputation, "SUSPICIOUS") == 0) {
+                for (int k = 0; k < p->depth; k++) printf("  ");
+                printf("  %s↳ %s (Exe: %s)%s\n", rep_color, p->assessment, p->exe, COLOR_RESET);
+            }
+        }
+    }
+
+    /* 3. Transmit completion */
+    char complete[512];
+    snprintf(complete, sizeof(complete),
+             "{\"type\":\"PROCESS_TREE_COMPLETE\",\"total\":%d,\"good\":%d,\"suspicious\":%d,\"bad\":%d,"
+             "\"agent_id\":\"%s\",\"timestamp\":\"%s\"}\n",
+             count, good_count, susp_count, bad_count, config.hostname, now_str);
+    send_siem_direct(complete);
+
+    free(procs);
+}
+
+/* Audit and stream all running services, versions, and security status to SIEM */
+static void report_services_to_siem(void)
+{
+    struct proc_node *procs = NULL;
+    int count = 0;
+    if (collect_processes(&procs, &count) != 0 || count == 0) {
+        char err_msg[256];
+        snprintf(err_msg, sizeof(err_msg),
+                 "{\"type\":\"ACTION_RESULT\",\"action\":\"services\",\"status\":\"FAILED\","
+                 "\"message\":\"Could not inspect services in /proc\",\"agent_id\":\"%s\"}\n", config.hostname);
+        send_siem_direct(err_msg);
+        return;
+    }
+
+    int total_services = 0, good_srv = 0, susp_srv = 0, bad_srv = 0;
+    for (int i = 0; i < count; i++) {
+        if (!procs[i].is_service) continue;
+        total_services++;
+        if (strcmp(procs[i].reputation, "GOOD") == 0) good_srv++;
+        else if (strcmp(procs[i].reputation, "BAD") == 0) bad_srv++;
+        else susp_srv++;
+    }
+
+    char now_str[64];
+    get_iso8601_time(now_str, sizeof(now_str));
+
+    printf("\n%s=================================================================================%s\n", COLOR_CYAN, COLOR_RESET);
+    printf("%s[⚙️  RUNNING SERVICES INVENTORY] Total: %d | Good: %s%d%s | Suspicious: %s%d%s | Bad: %s%d%s%s\n",
+           COLOR_BOLD, total_services, COLOR_GREEN, good_srv, COLOR_BOLD,
+           COLOR_YELLOW, susp_srv, COLOR_BOLD,
+           COLOR_RED, bad_srv, COLOR_BOLD, COLOR_RESET);
+    printf("%s=================================================================================%s\n", COLOR_CYAN, COLOR_RESET);
+
+    /* 1. Transmit header */
+    char header[512];
+    snprintf(header, sizeof(header),
+             "{\"type\":\"SERVICES_INVENTORY_HEADER\",\"agent_id\":\"%s\",\"total_services\":%d,"
+             "\"good\":%d,\"suspicious\":%d,\"bad\":%d,\"timestamp\":\"%s\"}\n",
+             config.hostname, total_services, good_srv, susp_srv, bad_srv, now_str);
+    send_siem_direct(header);
+
+    /* 2. Stream all service entries */
+    for (int i = 0; i < count; i++) {
+        struct proc_node *p = &procs[i];
+        if (!p->is_service) continue;
+
+        char esc_comm[32], esc_exe[512], esc_ver[128], esc_assess[512];
+        json_escape(p->comm, esc_comm, sizeof(esc_comm));
+        json_escape(p->exe, esc_exe, sizeof(esc_exe));
+        json_escape(p->version, esc_ver, sizeof(esc_ver));
+        json_escape(p->assessment, esc_assess, sizeof(esc_assess));
+
+        char entry[2048];
+        snprintf(entry, sizeof(entry),
+                 "{\"type\":\"SERVICE_ENTRY\",\"name\":\"%s\",\"pid\":%d,\"uid\":%u,\"exe\":\"%s\","
+                 "\"version\":\"%s\",\"reputation\":\"%s\",\"assessment\":\"%s\",\"agent_id\":\"%s\",\"timestamp\":\"%s\"}\n",
+                 esc_comm, p->pid, p->uid, esc_exe, esc_ver, p->reputation, esc_assess,
+                 config.hostname, now_str);
+        send_siem_direct(entry);
+
+        const char *color = COLOR_GREEN;
+        if (strcmp(p->reputation, "BAD") == 0) color = COLOR_RED;
+        else if (strcmp(p->reputation, "SUSPICIOUS") == 0) color = COLOR_YELLOW;
+
+        printf("  %s%-16s%s | PID: %-5d | Version: %-25s | Status: %s%-10s%s | %s\n",
+               COLOR_BOLD, p->comm, COLOR_RESET, p->pid,
+               strlen(p->version) > 0 ? p->version : "Installed",
+               color, p->reputation, COLOR_RESET, p->assessment);
+    }
+
+    /* 3. Transmit completion */
+    char complete[512];
+    snprintf(complete, sizeof(complete),
+             "{\"type\":\"SERVICES_INVENTORY_COMPLETE\",\"total_services\":%d,\"good\":%d,"
+             "\"suspicious\":%d,\"bad\":%d,\"agent_id\":\"%s\",\"timestamp\":\"%s\"}\n",
+             total_services, good_srv, susp_srv, bad_srv, config.hostname, now_str);
+    send_siem_direct(complete);
+
+    free(procs);
+}
+
+/* ========================================================================= */
 /* KILL SWITCH ENGINE                                                        */
 /* ========================================================================= */
 
@@ -597,7 +1096,13 @@ static void send_siem_direct(const char *buf)
 {
     pthread_mutex_lock(&socket_lock);
     if (siem_sockfd >= 0) {
-        send(siem_sockfd, buf, strlen(buf), MSG_NOSIGNAL);
+        size_t len = strlen(buf);
+        size_t sent_total = 0;
+        while (sent_total < len) {
+            ssize_t n = send(siem_sockfd, buf + sent_total, len - sent_total, MSG_NOSIGNAL);
+            if (n <= 0) break;
+            sent_total += n;
+        }
     }
     pthread_mutex_unlock(&socket_lock);
 }
@@ -615,11 +1120,17 @@ static void process_siem_command(const char *cmd_line)
 
     /* Parse JSON action command */
     if (json_get_string(cmd_line, "action", action, sizeof(action)) != 0) {
-        /* Support simple text fallback e.g. "KILL <pid>" or "PING" */
+        /* Support simple text fallback */
         if (sscanf(cmd_line, "KILL %d", &target_pid) == 1) {
             strncpy(action, "kill", sizeof(action) - 1);
         } else if (strcmp(cmd_line, "PING") == 0) {
             strncpy(action, "ping", sizeof(action) - 1);
+        } else if (strcmp(cmd_line, "PROCESS_TREE") == 0 || strcmp(cmd_line, "PS_TREE") == 0 || strcmp(cmd_line, "TREE") == 0) {
+            strncpy(action, "process_tree", sizeof(action) - 1);
+        } else if (strcmp(cmd_line, "SERVICES") == 0) {
+            strncpy(action, "services", sizeof(action) - 1);
+        } else if (strcmp(cmd_line, "INVENTORY") == 0 || strcmp(cmd_line, "AUDIT") == 0 || strcmp(cmd_line, "SCAN") == 0) {
+            strncpy(action, "inventory", sizeof(action) - 1);
         } else {
             fprintf(stderr, "[!] Unrecognized SIEM command: %s\n", cmd_line);
             return;
@@ -732,6 +1243,16 @@ static void process_siem_command(const char *cmd_line)
                  "\"events_processed\":%llu,\"alerts_detected\":%llu,\"agent_id\":\"%s\",\"timestamp\":\"%s\"}\n",
                  uptime, total_events_processed, total_alerts_detected, config.hostname, now_str);
         send_siem_direct(response);
+
+    } else if (strcmp(action, "process_tree") == 0 || strcmp(action, "ps_tree") == 0 || strcmp(action, "tree") == 0) {
+        report_process_tree_to_siem();
+
+    } else if (strcmp(action, "services") == 0 || strcmp(action, "service_list") == 0) {
+        report_services_to_siem();
+
+    } else if (strcmp(action, "inventory") == 0 || strcmp(action, "audit") == 0 || strcmp(action, "scan") == 0) {
+        report_services_to_siem();
+        report_process_tree_to_siem();
     }
 }
 
@@ -760,7 +1281,6 @@ static int init_network_connection(const char *host, const char *port)
         fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd < 0) continue;
 
-        /* Set non-blocking connect timeout handling */
         if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) {
             break;
         }
@@ -1136,6 +1656,9 @@ static void print_usage(const char *prog)
     printf("  -v, --verbose         Verbose debug and telemetry logging\n");
     printf("  -h, --help            Show this usage information\n\n");
     printf("Supported SIEM Remote Control Commands:\n");
+    printf("  {\"action\": \"process_tree\"} | PROCESS_TREE   Audit & stream full process tree (Good/Bad)\n");
+    printf("  {\"action\": \"services\"}     | SERVICES       Audit running services and versions (Good/Bad)\n");
+    printf("  {\"action\": \"inventory\"}    | INVENTORY      Complete endpoint audit (Tree + Services)\n");
     printf("  {\"action\": \"kill\", \"pid\": <PID>, [\"signal\": 9]}   Terminate process tree\n");
     printf("  {\"action\": \"suspend\", \"pid\": <PID>}             Pause process (SIGSTOP)\n");
     printf("  {\"action\": \"resume\", \"pid\": <PID>}              Resume process (SIGCONT)\n");
@@ -1274,6 +1797,7 @@ int main(int argc, char **argv)
     printf("    Host Identifier  : %s\n", config.hostname);
     printf("    Autonomous Kill  : %s\n", config.auto_kill ? "ENABLED (CRITICAL threats auto-killed)" : "DISABLED (Remote SIEM trigger only)");
     printf("    Noise Filtering  : ACTIVE (Filtered: cat, sed, ls, grep, awk, sleep, etc.)\n");
+    printf("    Process Tree     : READY (Responds to 'process_tree' / 'services' / 'inventory')\n");
     printf("    Kill Switch      : READY (Listening for SIEM instructions over TCP)\n");
     printf("=================================================================================\n");
 
